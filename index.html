@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0A3A25">
+<meta name="referrer" content="no-referrer">
+<title>BGL Live Scanner</title>
+<style>
+:root{--emerald:#0F5132;--deep:#0A3A25;--gold:#C9A54C;--gold2:#E9D79F;--ink:#ECE7DA;--bg:#0C1613;--ok:#32D583;--warn:#F2B266;--bad:#F49A94}
+*{box-sizing:border-box}html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font:15px/1.45 system-ui,-apple-system,'Segoe UI',Roboto,sans-serif}
+header{display:flex;align-items:center;gap:10px;padding:12px 16px;background:var(--deep)}
+header b{font-family:Georgia,serif;font-weight:400;color:var(--gold2);font-size:1.05rem}header small{display:block;color:#9fc0b0}
+.sp{flex:1}.seg{display:flex;background:#13211C;border-radius:10px;padding:3px}.seg button{border:0;background:none;color:#a9b5ae;font:600 .9rem system-ui;padding:9px 14px;border-radius:8px}.seg button.on{background:var(--gold);color:#1b1404}
+.stage{position:relative;max-width:520px;margin:12px auto 0;padding:0 12px}
+video{width:100%;aspect-ratio:1;object-fit:cover;border-radius:16px;background:#000;display:block}
+.frame{position:absolute;inset:12% 18%;border:3px solid rgba(233,215,159,.85);border-radius:18px;pointer-events:none;box-shadow:0 0 0 999px rgba(0,0,0,.25)}
+.res{max-width:520px;margin:12px auto;padding:0 12px}.card{border-radius:14px;padding:16px;font-weight:700;font-size:1.1rem;background:#13211C;border-left:6px solid var(--gold);min-height:58px}
+.card.ok{border-color:var(--ok)}.card.dup{border-color:var(--warn)}.card.bad{border-color:var(--bad)}.card small{display:block;font-weight:400;color:#a9b5ae;font-size:.85rem}
+.row{display:flex;gap:8px;max-width:520px;margin:10px auto;padding:0 12px}.row input{flex:1;padding:12px;border-radius:10px;border:1px solid #26392F;background:#13211C;color:var(--ink);font:inherit}
+.btn{border:0;border-radius:10px;padding:12px 16px;font:600 .95rem system-ui;background:var(--emerald);color:#fff}.btn.ghost{background:#13211C;color:var(--ink);border:1px solid #26392F}
+ul{list-style:none;margin:0 auto;padding:0 12px 40px;max-width:520px}li{display:flex;justify-content:space-between;gap:8px;padding:10px 4px;border-bottom:1px solid #1d2e27}li span{color:#a9b5ae;font-size:.85rem}
+.chip{font-size:.75rem;font-weight:700;padding:2px 9px;border-radius:99px;background:#1A2B25}.chip.Present{color:var(--ok)}.chip.Late{color:var(--warn)}.chip.Duplicate{color:var(--warn)}
+#gate{max-width:520px;margin:40px auto;padding:20px;text-align:center}
+@media (prefers-reduced-motion:reduce){*{transition:none!important;animation:none!important}}
+</style>
+</head>
+<body>
+<header><div><b>BGL Live Scanner</b><small id="ctx">Connecting…</small></div><div class="sp"></div>
+  <div class="seg" role="group" aria-label="Scan mode"><button class="on" data-m="CHECKIN">Check-in</button><button data-m="CHECKOUT">Check-out</button></div></header>
+<div id="gate" hidden></div>
+<main id="main" hidden>
+  <div class="stage"><video id="v" playsinline muted autoplay></video><div class="frame" aria-hidden="true"></div></div>
+  <div class="row"><button class="btn" id="start">Start camera</button><button class="btn ghost" id="flip">Switch camera</button><button class="btn ghost" id="torch" hidden>Torch</button></div>
+  <div class="res" aria-live="assertive"><div class="card" id="card">Point the camera at a member's QR code.</div></div>
+  <form class="row" id="manual"><input name="t" placeholder="Or type the code under the QR" autocomplete="off"><button class="btn ghost">Submit</button></form>
+  <ul id="log"></ul>
+</main>
+<script>
+(function () {
+  'use strict';
+  // Ticket and API address arrive in the URL fragment (never sent to this host's server).
+  var q = {}; location.hash.replace(/^#/, '').split('&').forEach(function (kv) { var p = kv.split('='); if (p[0]) q[p[0]] = decodeURIComponent(p[1] || ''); });
+  history.replaceState(null, '', location.pathname); // remove the ticket from the address bar / history
+  var API = q.api, K = q.k, mode = 'CHECKIN', facing = 'environment', stream = null, track = null, busy = false, last = {}, det = null, alive = false;
+  var $ = function (s) { return document.querySelector(s); };
+  function esc(s) { return String(s == null ? '' : s).replace(/[&<>"']/g, function (c) { return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]; }); }
+  function gate(msg) { $('#main').hidden = true; $('#gate').hidden = false; $('#gate').innerHTML = '<p>' + esc(msg) + '</p><p style="color:#a9b5ae">Open the scanner again from the BGL app: Attendance → Scan → Open live scanner.</p>'; $('#ctx').textContent = 'Not connected'; }
+  if (!API || !K || !/^https:\/\/script\.google(usercontent)?\.com\//.test(API)) { gate('This scanner link is incomplete or invalid.'); return; }
+  function call(body) {
+    body.k = K;
+    return fetch(API, { method: 'POST', body: JSON.stringify(body), redirect: 'follow' }).then(function (r) { return r.json(); }).then(function (r) { if (!r.ok) throw r; return r.data; });
+  }
+  var ac = null;
+  function beep(ok) { try { ac = ac || new (window.AudioContext || window.webkitAudioContext)(); var o = ac.createOscillator(), g = ac.createGain(); o.frequency.value = ok ? 880 : 220; g.gain.value = 0.08; o.connect(g); g.connect(ac.destination); o.start(); o.stop(ac.currentTime + (ok ? 0.12 : 0.3)); } catch (e) {} try { navigator.vibrate && navigator.vibrate(ok ? 40 : [80, 50, 80]); } catch (e) {} }
+  function show(cls, title, sub) { var c = $('#card'); c.className = 'card ' + cls; c.innerHTML = esc(title) + (sub ? '<small>' + esc(sub) + '</small>' : ''); }
+  function submit(tok) {
+    tok = String(tok || '').trim(); if (!tok || busy) return;
+    if (last[tok + mode] && Date.now() - last[tok + mode] < 5000) return; last[tok + mode] = Date.now(); busy = true;
+    call({ action: 'scan', Token: tok, Mode: mode }).then(function (r) {
+      var dup = !!r.duplicate; beep(!dup);
+      var st = dup ? 'Duplicate' : (mode === 'CHECKIN' ? r.status : 'Checked out');
+      show(dup ? 'dup' : 'ok', r.name + ' — ' + (dup ? 'already ' + (mode === 'CHECKIN' ? 'checked in' : 'checked out') : st + (r.lateMinutes ? ' (' + r.lateMinutes + ' min late)' : '')), 'ITS ' + r.its);
+      $('#log').insertAdjacentHTML('afterbegin', '<li><div>' + esc(r.name) + '<br><span>' + esc(r.its) + ' · ' + new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) + '</span></div><span class="chip ' + esc(st.split(' ')[0]) + '">' + esc(st) + '</span></li>');
+    }).catch(function (e) { beep(false); show('bad', e.message || 'Scan failed', e.code === 'AUTH' ? 'Open the scanner again from the app.' : ''); if (e.code === 'AUTH') stop(); })
+      .finally(function () { busy = false; });
+  }
+  function loadJsQR() { return window.jsQR ? Promise.resolve() : new Promise(function (res, rej) { var s = document.createElement('script'); s.src = 'https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.min.js'; s.onload = res; s.onerror = rej; document.head.appendChild(s); }); }
+  var cv = document.createElement('canvas'), cx = cv.getContext('2d', { willReadFrequently: true });
+  function decode(v) {
+    if (det) return det.detect(v).then(function (c) { return c[0] && c[0].rawValue; });
+    var w = v.videoWidth, h = v.videoHeight; if (!w) return Promise.resolve(null);
+    var sc = Math.min(1, 640 / Math.max(w, h)); cv.width = w * sc; cv.height = h * sc; cx.drawImage(v, 0, 0, cv.width, cv.height);
+    var d = cx.getImageData(0, 0, cv.width, cv.height); var r = window.jsQR(d.data, d.width, d.height, { inversionAttempts: 'dontInvert' }); return Promise.resolve(r && r.data);
+  }
+  function loop() { if (!alive) return; var v = $('#v'); (v.readyState >= 2 ? decode(v) : Promise.resolve(null)).then(function (t) { if (t) submit(t); }).catch(function () {}).finally(function () { setTimeout(loop, 250); }); }
+  function stop() { alive = false; if (stream) stream.getTracks().forEach(function (t) { t.stop(); }); stream = null; }
+  function start() {
+    stop();
+    var ready = ('BarcodeDetector' in window) ? BarcodeDetector.getSupportedFormats().then(function (f) { if (f.indexOf('qr_code') >= 0) det = new BarcodeDetector({ formats: ['qr_code'] }); else return loadJsQR(); }) : loadJsQR();
+    ready.then(function () { return navigator.mediaDevices.getUserMedia({ video: { facingMode: { ideal: facing }, width: { ideal: 1280 }, height: { ideal: 1280 } }, audio: false }); })
+      .then(function (s) {
+        stream = s; track = s.getVideoTracks()[0]; var v = $('#v'); v.srcObject = s; v.play(); alive = true; $('#start').textContent = 'Camera on'; loop();
+        try { var caps = track.getCapabilities ? track.getCapabilities() : {}; $('#torch').hidden = !caps.torch; } catch (e) {}
+        try { localStorage.setItem('bgl.scan.cam', '1'); } catch (e) {}
+      }).catch(function (e) { show('bad', 'Camera not available', e && e.name === 'NotAllowedError' ? 'Allow camera access for this page in your browser settings, then tap Start camera.' : 'Use the code box below instead.'); });
+  }
+  $('#start').onclick = start;
+  $('#flip').onclick = function () { facing = facing === 'environment' ? 'user' : 'environment'; start(); };
+  var torchOn = false; $('#torch').onclick = function () { torchOn = !torchOn; track && track.applyConstraints({ advanced: [{ torch: torchOn }] }).catch(function () {}); };
+  Array.prototype.forEach.call(document.querySelectorAll('[data-m]'), function (b) { b.onclick = function () { mode = b.dataset.m; Array.prototype.forEach.call(document.querySelectorAll('[data-m]'), function (x) { x.classList.toggle('on', x === b); }); show('', 'Mode: ' + (mode === 'CHECKIN' ? 'Check-in' : 'Check-out')); }; });
+  $('#manual').onsubmit = function (e) { e.preventDefault(); submit(this.t.value); this.t.value = ''; };
+  document.addEventListener('visibilitychange', function () { if (document.hidden) stop(); else if (!alive && !$('#main').hidden) start(); });
+  call({ action: 'info' }).then(function (i) {
+    $('#ctx').textContent = i.context + ' · ' + i.day + ' · ' + i.scanner; $('#main').hidden = false;
+    if (i.day !== i.today) show('bad', 'This session is for ' + i.day, 'Live scanning only works on the day itself.');
+    start(); // camera starts immediately (browser asks permission the first time)
+  }).catch(function (e) { gate(e.message || 'Could not connect.'); });
+})();
+</script>
+</body>
+</html>
